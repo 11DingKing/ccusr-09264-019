@@ -22,12 +22,174 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    RecoveryAttempt,
+    RecoveryJob,
     ReviewPackage,
     ReviewRequest,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_SCHEMA_V1 = """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id        TEXT PRIMARY KEY,
+        institution_id TEXT,
+        roles_json     TEXT NOT NULL,
+        display_name   TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS blobs (
+        sha256     TEXT PRIMARY KEY,
+        data       BLOB NOT NULL,
+        media_type TEXT NOT NULL,
+        size       INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS materials (
+        material_id        TEXT PRIMARY KEY,
+        institution_id     TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        sensitivity        TEXT NOT NULL,
+        title              TEXT NOT NULL,
+        current_version_id TEXT,
+        withdrawn          INTEGER NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS versions (
+        version_id              TEXT PRIMARY KEY,
+        material_id             TEXT NOT NULL REFERENCES materials(material_id),
+        institution_id          TEXT NOT NULL,
+        sha256                  TEXT NOT NULL,
+        size                    INTEGER NOT NULL,
+        media_type              TEXT NOT NULL,
+        version_no              INTEGER NOT NULL,
+        supersedes_version_id   TEXT,
+        created_by              TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        withdrawn               INTEGER NOT NULL DEFAULT 0,
+        withdrawn_at            TEXT,
+        UNIQUE(material_id, version_no)
+    );
+
+    CREATE TABLE IF NOT EXISTS packages (
+        package_id            TEXT PRIMARY KEY,
+        institution_id        TEXT NOT NULL,
+        title                 TEXT NOT NULL,
+        status                TEXT NOT NULL,
+        created_by            TEXT NOT NULL,
+        created_at            TEXT NOT NULL,
+        sealed_at             TEXT,
+        manifest_fingerprint  TEXT,
+        decided_at            TEXT,
+        decision              TEXT,
+        decision_note         TEXT,
+        review_fingerprint    TEXT,
+        supersedes_package_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS entries (
+        entry_id    TEXT PRIMARY KEY,
+        package_id  TEXT NOT NULL REFERENCES packages(package_id),
+        material_id TEXT NOT NULL,
+        version_id  TEXT NOT NULL REFERENCES versions(version_id),
+        sha256      TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        sensitivity TEXT NOT NULL,
+        added_at    TEXT NOT NULL,
+        UNIQUE(package_id, version_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS requests (
+        request_id       TEXT PRIMARY KEY,
+        package_id       TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id   TEXT NOT NULL,
+        reviewer_id      TEXT NOT NULL,
+        status           TEXT NOT NULL,
+        assigned_by      TEXT NOT NULL,
+        assigned_at      TEXT NOT NULL,
+        responded_at     TEXT,
+        completed_at     TEXT,
+        verdict          TEXT,
+        comment          TEXT,
+        deadline_at_utc  TEXT,
+        deadline_timezone TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_requests_reviewer
+        ON requests(reviewer_id, status);
+    CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
+
+    CREATE TABLE IF NOT EXISTS objections (
+        objection_id  TEXT PRIMARY KEY,
+        request_id    TEXT NOT NULL REFERENCES requests(request_id),
+        package_id    TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id TEXT NOT NULL,
+        reviewer_id   TEXT NOT NULL,
+        category      TEXT NOT NULL,
+        detail        TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+        audit_id       TEXT PRIMARY KEY,
+        package_id     TEXT,
+        institution_id TEXT,
+        actor_id       TEXT NOT NULL,
+        action         TEXT NOT NULL,
+        at             TEXT NOT NULL,
+        detail_json    TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS idempotency (
+        idempotency_key TEXT PRIMARY KEY,
+        result_json     TEXT NOT NULL,
+        created_at      TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        token       TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL REFERENCES users(user_id),
+        created_at  TEXT NOT NULL
+    );
+
+    PRAGMA user_version = 1;
+"""
+
+# v2：失败恢复作业（失败队列）。作业与每次失败/重试事件都落库，
+# 服务重启后队列与失败历史不丢。
+_SCHEMA_V2 = """
+    CREATE TABLE IF NOT EXISTS recovery_jobs (
+        job_id       TEXT PRIMARY KEY,
+        operation    TEXT NOT NULL,
+        target_id    TEXT NOT NULL,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        status       TEXT NOT NULL,
+        failed_step  TEXT NOT NULL,
+        retry_count  INTEGER NOT NULL DEFAULT 0,
+        last_error   TEXT NOT NULL,
+        created_by   TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL,
+        completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_recovery_jobs_status
+        ON recovery_jobs(status, created_at);
+
+    CREATE TABLE IF NOT EXISTS recovery_attempts (
+        attempt_id TEXT PRIMARY KEY,
+        job_id     TEXT NOT NULL REFERENCES recovery_jobs(job_id),
+        step       TEXT NOT NULL,
+        ok         INTEGER NOT NULL,
+        error      TEXT,
+        at         TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recovery_attempts_job
+        ON recovery_attempts(job_id);
+
+    PRAGMA user_version = 2;
+"""
 
 
 class SqliteRepository(Repository):
@@ -49,136 +211,11 @@ class SqliteRepository(Repository):
     # ---------------------------------------------------------------- schema
     def _ensure_schema(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= SCHEMA_VERSION:
-            return
-        # executescript 会自行提交事务；把 user_version 写入放在同一脚本
-        self._conn.executescript(
-            """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id        TEXT PRIMARY KEY,
-                    institution_id TEXT,
-                    roles_json     TEXT NOT NULL,
-                    display_name   TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS blobs (
-                    sha256     TEXT PRIMARY KEY,
-                    data       BLOB NOT NULL,
-                    media_type TEXT NOT NULL,
-                    size       INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS materials (
-                    material_id        TEXT PRIMARY KEY,
-                    institution_id     TEXT NOT NULL,
-                    kind               TEXT NOT NULL,
-                    sensitivity        TEXT NOT NULL,
-                    title              TEXT NOT NULL,
-                    current_version_id TEXT,
-                    withdrawn          INTEGER NOT NULL DEFAULT 0,
-                    created_at         TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS versions (
-                    version_id              TEXT PRIMARY KEY,
-                    material_id             TEXT NOT NULL REFERENCES materials(material_id),
-                    institution_id          TEXT NOT NULL,
-                    sha256                  TEXT NOT NULL,
-                    size                    INTEGER NOT NULL,
-                    media_type              TEXT NOT NULL,
-                    version_no              INTEGER NOT NULL,
-                    supersedes_version_id   TEXT,
-                    created_by              TEXT NOT NULL,
-                    created_at              TEXT NOT NULL,
-                    withdrawn               INTEGER NOT NULL DEFAULT 0,
-                    withdrawn_at            TEXT,
-                    UNIQUE(material_id, version_no)
-                );
-
-                CREATE TABLE IF NOT EXISTS packages (
-                    package_id            TEXT PRIMARY KEY,
-                    institution_id        TEXT NOT NULL,
-                    title                 TEXT NOT NULL,
-                    status                TEXT NOT NULL,
-                    created_by            TEXT NOT NULL,
-                    created_at            TEXT NOT NULL,
-                    sealed_at             TEXT,
-                    manifest_fingerprint  TEXT,
-                    decided_at            TEXT,
-                    decision              TEXT,
-                    decision_note         TEXT,
-                    review_fingerprint    TEXT,
-                    supersedes_package_id TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS entries (
-                    entry_id    TEXT PRIMARY KEY,
-                    package_id  TEXT NOT NULL REFERENCES packages(package_id),
-                    material_id TEXT NOT NULL,
-                    version_id  TEXT NOT NULL REFERENCES versions(version_id),
-                    sha256      TEXT NOT NULL,
-                    kind        TEXT NOT NULL,
-                    sensitivity TEXT NOT NULL,
-                    added_at    TEXT NOT NULL,
-                    UNIQUE(package_id, version_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS requests (
-                    request_id       TEXT PRIMARY KEY,
-                    package_id       TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id   TEXT NOT NULL,
-                    reviewer_id      TEXT NOT NULL,
-                    status           TEXT NOT NULL,
-                    assigned_by      TEXT NOT NULL,
-                    assigned_at      TEXT NOT NULL,
-                    responded_at     TEXT,
-                    completed_at     TEXT,
-                    verdict          TEXT,
-                    comment          TEXT,
-                    deadline_at_utc  TEXT,
-                    deadline_timezone TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_requests_reviewer
-                    ON requests(reviewer_id, status);
-                CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
-
-                CREATE TABLE IF NOT EXISTS objections (
-                    objection_id  TEXT PRIMARY KEY,
-                    request_id    TEXT NOT NULL REFERENCES requests(request_id),
-                    package_id    TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id TEXT NOT NULL,
-                    reviewer_id   TEXT NOT NULL,
-                    category      TEXT NOT NULL,
-                    detail        TEXT NOT NULL,
-                    created_at    TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    audit_id       TEXT PRIMARY KEY,
-                    package_id     TEXT,
-                    institution_id TEXT,
-                    actor_id       TEXT NOT NULL,
-                    action         TEXT NOT NULL,
-                    at             TEXT NOT NULL,
-                    detail_json    TEXT NOT NULL DEFAULT '{}'
-                );
-
-                CREATE TABLE IF NOT EXISTS idempotency (
-                    idempotency_key TEXT PRIMARY KEY,
-                    result_json     TEXT NOT NULL,
-                    created_at      TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS api_tokens (
-                    token       TEXT PRIMARY KEY,
-                    user_id     TEXT NOT NULL REFERENCES users(user_id),
-                    created_at  TEXT NOT NULL
-                );
-
-                PRAGMA user_version = 1;
-            """
-        )
+        if version < 1:
+            # executescript 会自行提交事务；把 user_version 写入放在同一脚本
+            self._conn.executescript(_SCHEMA_V1)
+        if version < 2:
+            self._conn.executescript(_SCHEMA_V2)
 
     @contextlib.contextmanager
     def _txn_direct(self) -> Iterator[None]:
@@ -667,6 +704,116 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
+    # -------------------------------------------------------- 失败恢复作业
+    def insert_recovery_job(self, job: RecoveryJob) -> None:
+        self._conn.execute(
+            "INSERT INTO recovery_jobs(job_id, operation, target_id, payload_json,"
+            " status, failed_step, retry_count, last_error, created_by, created_at,"
+            " updated_at, completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                job.job_id,
+                job.operation,
+                job.target_id,
+                json.dumps(job.payload, ensure_ascii=False),
+                job.status,
+                job.failed_step,
+                job.retry_count,
+                job.last_error,
+                job.created_by,
+                job.created_at,
+                job.updated_at,
+                job.completed_at,
+            ),
+        )
+
+    def get_recovery_job(self, job_id: str) -> RecoveryJob | None:
+        row = self._conn.execute(
+            "SELECT * FROM recovery_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return None if row is None else _row_to_recovery_job(row)
+
+    def find_pending_recovery_job(
+        self, operation: str, target_id: str
+    ) -> RecoveryJob | None:
+        row = self._conn.execute(
+            "SELECT * FROM recovery_jobs WHERE operation = ? AND target_id = ?"
+            " AND status = 'pending' ORDER BY rowid LIMIT 1",
+            (operation, target_id),
+        ).fetchone()
+        return None if row is None else _row_to_recovery_job(row)
+
+    def list_recovery_jobs(self, status: str | None = None) -> list[RecoveryJob]:
+        if status is None:
+            rows = self._conn.execute(
+                "SELECT * FROM recovery_jobs ORDER BY created_at, rowid"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM recovery_jobs WHERE status = ?"
+                " ORDER BY created_at, rowid",
+                (status,),
+            ).fetchall()
+        return [_row_to_recovery_job(r) for r in rows]
+
+    def note_recovery_failure(
+        self,
+        job_id: str,
+        failed_step: str,
+        error: str,
+        at: str,
+        *,
+        count_retry: bool,
+    ) -> bool:
+        retry_sql = "retry_count = retry_count + 1, " if count_retry else ""
+        cur = self._conn.execute(
+            f"UPDATE recovery_jobs SET {retry_sql}failed_step = ?, last_error = ?,"
+            " updated_at = ? WHERE job_id = ? AND status = 'pending'",
+            (failed_step, error, at, job_id),
+        )
+        return cur.rowcount == 1
+
+    def complete_recovery_job(
+        self, job_id: str, expected_status: str, at: str
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE recovery_jobs SET status = 'succeeded',"
+            " retry_count = retry_count + 1, completed_at = ?, updated_at = ?"
+            " WHERE job_id = ? AND status = ?",
+            (at, at, job_id, expected_status),
+        )
+        return cur.rowcount == 1
+
+    def insert_recovery_attempt(self, attempt: RecoveryAttempt) -> None:
+        self._conn.execute(
+            "INSERT INTO recovery_attempts(attempt_id, job_id, step, ok, error, at)"
+            " VALUES(?,?,?,?,?,?)",
+            (
+                attempt.attempt_id,
+                attempt.job_id,
+                attempt.step,
+                int(attempt.ok),
+                attempt.error,
+                attempt.at,
+            ),
+        )
+
+    def list_recovery_attempts(self, job_id: str) -> list[RecoveryAttempt]:
+        rows = self._conn.execute(
+            "SELECT * FROM recovery_attempts WHERE job_id = ? ORDER BY rowid",
+            (job_id,),
+        ).fetchall()
+        return [
+            RecoveryAttempt(
+                attempt_id=r["attempt_id"],
+                job_id=r["job_id"],
+                step=r["step"],
+                ok=bool(r["ok"]),
+                error=r["error"],
+                at=r["at"],
+            )
+            for r in rows
+        ]
+
 
 def _row_to_user(row: sqlite3.Row) -> User:
     return User(
@@ -716,4 +863,21 @@ def _row_to_entry(row: sqlite3.Row) -> PackageEntry:
         kind=row["kind"],
         sensitivity=row["sensitivity"],
         added_at=row["added_at"],
+    )
+
+
+def _row_to_recovery_job(row: sqlite3.Row) -> RecoveryJob:
+    return RecoveryJob(
+        job_id=row["job_id"],
+        operation=row["operation"],
+        target_id=row["target_id"],
+        payload=json.loads(row["payload_json"]),
+        status=row["status"],
+        failed_step=row["failed_step"],
+        retry_count=row["retry_count"],
+        last_error=row["last_error"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
     )

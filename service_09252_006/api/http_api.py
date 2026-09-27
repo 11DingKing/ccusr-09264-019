@@ -13,7 +13,7 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from ..application.container import ApplicationContext
 from ..domain.enums import Role
@@ -394,6 +394,44 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # ----------------------------------------------------- 失败恢复作业
+    def create_recovery_job(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.recovery.record_failure(
+            actor,
+            operation=body["operation"],
+            target_id=body["target_id"],
+            failed_step=body["failed_step"],
+            error=body["error"],
+            payload=body.get("payload"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def list_recovery_jobs(self) -> None:
+        actor = self._actor()
+        query = parse_qs(urlparse(self.path).query)
+        status = query.get("status", [None])[0]
+        self._send_json(
+            200, {"jobs": self.services.recovery.list_jobs(actor, status=status)}
+        )
+
+    def get_recovery_job(self, job_id: str) -> None:
+        actor = self._actor()
+        self._send_json(200, self.services.recovery.get_job(actor, job_id))
+
+    def retry_recovery_job(self, job_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200,
+            self.services.recovery.retry(
+                actor,
+                job_id=job_id,
+                idempotency_key=self._idempotency_key(),
+            ),
+        )
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -413,6 +451,8 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
         ("/v1/requests/{request_id}/verdict", "submit_verdict"),
+        ("/v1/recovery/jobs", "create_recovery_job"),
+        ("/v1/recovery/jobs/{job_id}/retry", "retry_recovery_job"),
     ]
     get = [
         ("/v1/materials/{material_id}", "get_material"),
@@ -424,6 +464,8 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",
         ),
+        ("/v1/recovery/jobs", "list_recovery_jobs"),
+        ("/v1/recovery/jobs/{job_id}", "get_recovery_job"),
     ]
     return {"POST": post, "GET": get}
 

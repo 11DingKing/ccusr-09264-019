@@ -146,5 +146,39 @@ class AuditEntry:
     detail: dict = field(default_factory=dict)
 
 
+@dataclass
+class RecoveryJob:
+    """失败恢复作业：一次失败运维操作的持久化记录，等待运维重试。
+
+    failed_step / retry_count / last_error 在作业恢复后仍然保留，
+    作为失败历史供事后查看。
+    """
+
+    job_id: str
+    operation: str             # 运维操作名（package.seal / decision.issue）
+    target_id: str             # 作用对象（如 package_id）
+    payload: dict              # 重试所需参数（如 decision/note）
+    status: str                # RecoveryJobStatus
+    failed_step: str           # 失败步骤
+    retry_count: int           # 已执行的重试次数
+    last_error: str            # 最后一次错误消息
+    created_by: str
+    created_at: str
+    updated_at: str
+    completed_at: Optional[str]
+
+
+@dataclass
+class RecoveryAttempt:
+    """恢复作业的一次失败/重试事件（失败历史，按写入顺序排列）。"""
+
+    attempt_id: str
+    job_id: str
+    step: str
+    ok: bool
+    error: Optional[str]
+    at: str
+
+
 def asdict(obj) -> dict:
     return dataclasses.asdict(obj)

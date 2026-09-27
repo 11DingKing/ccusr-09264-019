@@ -49,3 +49,8 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class RecoveryJobStatus(str, Enum):
+    PENDING = "pending"        # 待恢复：失败已记录，可重试
+    SUCCEEDED = "succeeded"    # 已恢复：重试成功，状态已推进一次

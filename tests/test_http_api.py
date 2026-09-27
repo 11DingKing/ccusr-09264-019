@@ -197,6 +197,82 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
 
+    def test_recovery_queue_over_http(self) -> None:
+        admin = self._create_user(
+            "admin-a", ["institution_admin"], "inst-a", "tok-admin"
+        )
+        authority = self._create_user(
+            "auth", ["quality_authority"], None, "tok-auth"
+        )
+
+        # 造一个草稿包
+        status, mat = admin.request(
+            "POST", "/v1/materials", {"kind": "syllabus", "title": "大纲"}
+        )
+        self.assertEqual(status, 201)
+        status, ver = admin.request(
+            "POST", f"/v1/materials/{mat['material_id']}/versions",
+            {"content_base64": base64.b64encode(b"v1").decode("ascii")},
+        )
+        self.assertEqual(status, 201)
+        status, pkg = admin.request("POST", "/v1/packages", {"title": "恢复演练"})
+        pid = pkg["package_id"]
+        status, _ = admin.request(
+            "POST", f"/v1/packages/{pid}/entries",
+            {"version_id": ver["version_id"]},
+        )
+        self.assertEqual(status, 201)
+
+        # 普通机构管理员不能操作失败队列
+        status, body = admin.request(
+            "POST", "/v1/recovery/jobs",
+            {"operation": "package.seal", "target_id": pid,
+             "failed_step": "seal_package", "error": "database is locked"},
+        )
+        self.assertEqual(status, 403)
+
+        # 运维登记失败作业
+        status, job = authority.request(
+            "POST", "/v1/recovery/jobs",
+            {"operation": "package.seal", "target_id": pid,
+             "failed_step": "seal_package", "error": "database is locked"},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(job["status"], "pending")
+        self.assertEqual(job["retry_count"], 0)
+        self.assertEqual(job["last_error"], "database is locked")
+
+        status, queue = authority.request("GET", "/v1/recovery/jobs?status=pending")
+        self.assertEqual(status, 200)
+        self.assertEqual([j["job_id"] for j in queue["jobs"]], [job["job_id"]])
+
+        # 重试成功：包只推进一次到 sealed
+        status, done = authority.request(
+            "POST", f"/v1/recovery/jobs/{job['job_id']}/retry", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(done["status"], "succeeded")
+        self.assertEqual(done["retry_count"], 1)
+        status, view = authority.request("GET", f"/v1/packages/{pid}")
+        self.assertEqual(view["status"], "sealed")
+
+        # 重复重试只是回放
+        status, again = authority.request(
+            "POST", f"/v1/recovery/jobs/{job['job_id']}/retry", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(again["replayed"])
+        self.assertEqual(again["retry_count"], 1)
+
+        # 失败历史可查
+        status, detail = authority.request(
+            "GET", f"/v1/recovery/jobs/{job['job_id']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["failed_step"], "seal_package")
+        steps = [(a["step"], a["ok"]) for a in detail["attempts"]]
+        self.assertEqual(steps, [("seal_package", False), ("seal_package", True)])
+
 
 if __name__ == "__main__":
     unittest.main()

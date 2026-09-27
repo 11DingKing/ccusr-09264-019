@@ -16,6 +16,8 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    RecoveryAttempt,
+    RecoveryJob,
     ReviewPackage,
     ReviewRequest,
     User,
@@ -148,3 +150,46 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 失败恢复作业 ----
+    @abc.abstractmethod
+    def insert_recovery_job(self, job: RecoveryJob) -> None: ...
+
+    @abc.abstractmethod
+    def get_recovery_job(self, job_id: str) -> RecoveryJob | None: ...
+
+    @abc.abstractmethod
+    def find_pending_recovery_job(
+        self, operation: str, target_id: str
+    ) -> RecoveryJob | None:
+        """同一操作同一对象的待恢复作业（失败队列去重依据）。"""
+
+    @abc.abstractmethod
+    def list_recovery_jobs(self, status: str | None = None) -> list[RecoveryJob]: ...
+
+    @abc.abstractmethod
+    def note_recovery_failure(
+        self,
+        job_id: str,
+        failed_step: str,
+        error: str,
+        at: str,
+        *,
+        count_retry: bool,
+    ) -> bool:
+        """更新失败步骤与最后错误；count_retry 时累加重试次数。
+
+        仅作业仍处于 pending 时生效（条件更新），返回是否命中。
+        """
+
+    @abc.abstractmethod
+    def complete_recovery_job(
+        self, job_id: str, expected_status: str, at: str
+    ) -> bool:
+        """条件推进到 succeeded（重试次数 +1）；并发重试下只有一方返回 True。"""
+
+    @abc.abstractmethod
+    def insert_recovery_attempt(self, attempt: RecoveryAttempt) -> None: ...
+
+    @abc.abstractmethod
+    def list_recovery_attempts(self, job_id: str) -> list[RecoveryAttempt]: ...
