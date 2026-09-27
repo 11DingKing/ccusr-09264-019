@@ -22,12 +22,13 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    RecoveryJob,
     ReviewPackage,
     ReviewRequest,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -49,11 +50,10 @@ class SqliteRepository(Repository):
     # ---------------------------------------------------------------- schema
     def _ensure_schema(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= SCHEMA_VERSION:
-            return
         # executescript 会自行提交事务；把 user_version 写入放在同一脚本
-        self._conn.executescript(
-            """
+        if version < 1:
+            self._conn.executescript(
+                """
                 CREATE TABLE IF NOT EXISTS users (
                     user_id        TEXT PRIMARY KEY,
                     institution_id TEXT,
@@ -178,7 +178,28 @@ class SqliteRepository(Repository):
 
                 PRAGMA user_version = 1;
             """
-        )
+            )
+        if version < 2:
+            # 失败恢复作业：失败步骤、重试次数、最后错误持久化，重启不丢
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS recovery_jobs (
+                    job_id       TEXT PRIMARY KEY,
+                    step         TEXT NOT NULL,
+                    status       TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    retry_count  INTEGER NOT NULL DEFAULT 0,
+                    last_error   TEXT NOT NULL DEFAULT '',
+                    created_at   TEXT NOT NULL,
+                    updated_at   TEXT NOT NULL,
+                    resolved_at  TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_recovery_jobs_status
+                    ON recovery_jobs(status);
+
+                PRAGMA user_version = 2;
+            """
+            )
 
     @contextlib.contextmanager
     def _txn_direct(self) -> Iterator[None]:
@@ -666,6 +687,79 @@ class SqliteRepository(Repository):
             )
             for r in rows
         ]
+
+    # ------------------------------------------------------- recovery jobs
+    def insert_recovery_job(self, job: RecoveryJob) -> None:
+        self._conn.execute(
+            "INSERT INTO recovery_jobs(job_id, step, status, payload_json,"
+            " retry_count, last_error, created_at, updated_at, resolved_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                job.job_id,
+                job.step,
+                job.status,
+                json.dumps(job.payload, ensure_ascii=False),
+                job.retry_count,
+                job.last_error,
+                job.created_at,
+                job.updated_at,
+                job.resolved_at,
+            ),
+        )
+
+    def _row_to_recovery_job(self, row: sqlite3.Row) -> RecoveryJob:
+        return RecoveryJob(
+            job_id=row["job_id"],
+            step=row["step"],
+            status=row["status"],
+            payload=json.loads(row["payload_json"]),
+            retry_count=row["retry_count"],
+            last_error=row["last_error"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            resolved_at=row["resolved_at"],
+        )
+
+    def get_recovery_job(self, job_id: str) -> RecoveryJob | None:
+        row = self._conn.execute(
+            "SELECT * FROM recovery_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_recovery_job(row)
+
+    def list_recovery_jobs(self, status: str | None = None) -> list[RecoveryJob]:
+        if status is None:
+            rows = self._conn.execute(
+                "SELECT * FROM recovery_jobs ORDER BY created_at, job_id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM recovery_jobs WHERE status = ?"
+                " ORDER BY created_at, job_id",
+                (status,),
+            ).fetchall()
+        return [self._row_to_recovery_job(r) for r in rows]
+
+    def note_recovery_retry_failure(
+        self, job_id: str, expected_status: str, error: str, at: str
+    ) -> bool:
+        # 相对自增，避免并发重试下的丢失更新
+        cur = self._conn.execute(
+            "UPDATE recovery_jobs SET retry_count = retry_count + 1,"
+            " last_error = ?, updated_at = ? WHERE job_id = ? AND status = ?",
+            (error, at, job_id, expected_status),
+        )
+        return cur.rowcount == 1
+
+    def complete_recovery_job(
+        self, job_id: str, expected_status: str, at: str
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE recovery_jobs SET status = 'succeeded',"
+            " retry_count = retry_count + 1, resolved_at = ?, updated_at = ?"
+            " WHERE job_id = ? AND status = ?",
+            (at, at, job_id, expected_status),
+        )
+        return cur.rowcount == 1
 
 
 def _row_to_user(row: sqlite3.Row) -> User:

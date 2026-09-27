@@ -16,6 +16,7 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    RecoveryJob,
     ReviewPackage,
     ReviewRequest,
     User,
@@ -148,3 +149,25 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 失败恢复作业 ----
+    @abc.abstractmethod
+    def insert_recovery_job(self, job: RecoveryJob) -> None: ...
+
+    @abc.abstractmethod
+    def get_recovery_job(self, job_id: str) -> RecoveryJob | None: ...
+
+    @abc.abstractmethod
+    def list_recovery_jobs(self, status: str | None = None) -> list[RecoveryJob]: ...
+
+    @abc.abstractmethod
+    def note_recovery_retry_failure(
+        self, job_id: str, expected_status: str, error: str, at: str
+    ) -> bool:
+        """重试仍失败：retry_count+1 并更新最后错误；条件更新，状态不符返回 False。"""
+
+    @abc.abstractmethod
+    def complete_recovery_job(
+        self, job_id: str, expected_status: str, at: str
+    ) -> bool:
+        """重试成功：推进到 succeeded；条件更新保证并发/重复下只推进一次。"""
